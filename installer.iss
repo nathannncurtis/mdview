@@ -1,6 +1,6 @@
 [Setup]
 AppName=mdview
-AppVersion={#GetEnv('MDVIEW_VERSION')}
+AppVersion={#MDVIEW_VERSION}
 DefaultDirName={autopf}\mdview
 DefaultGroupName=mdview
 OutputBaseFilename=mdview-setup
