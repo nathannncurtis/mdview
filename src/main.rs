@@ -3,7 +3,35 @@
 use notify::{EventKind, RecursiveMode, Watcher};
 use pulldown_cmark::{html, Options, Parser};
 use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Mutex;
 use std::{env, fs, path::PathBuf, process};
+
+static LOG_FILE: Mutex<Option<fs::File>> = Mutex::new(None);
+
+fn init_log() {
+    if let Some(dir) = dirs_next() {
+        let log_dir = dir.join("mdview");
+        let _ = fs::create_dir_all(&log_dir);
+        let path = log_dir.join("mdview.log");
+        if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            *LOG_FILE.lock().unwrap() = Some(f);
+        }
+    }
+}
+
+fn log(msg: &str) {
+    if let Ok(mut guard) = LOG_FILE.lock() {
+        if let Some(ref mut f) = *guard {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let _ = writeln!(f, "[{now}] {msg}");
+            let _ = f.flush();
+        }
+    }
+}
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -11,7 +39,9 @@ use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
 fn main() {
+    init_log();
     let args: Vec<String> = env::args().collect();
+    log(&format!("started with args: {:?}", args));
 
     if args.len() >= 2 && args[1] == "--register" {
         register_file_association();
@@ -25,14 +55,16 @@ fn main() {
     }
 
     let path = fs::canonicalize(&args[1]).unwrap_or_else(|e| {
-        eprintln!("Failed to resolve path {}: {e}", &args[1]);
+        log(&format!("failed to resolve path {}: {e}", &args[1]));
         process::exit(1);
     });
+    log(&format!("opening: {}", path.display()));
 
     let markdown = fs::read_to_string(&path).unwrap_or_else(|e| {
-        eprintln!("Failed to read {}: {e}", path.display());
+        log(&format!("failed to read {}: {e}", path.display()));
         process::exit(1);
     });
+    log(&format!("read {} bytes", markdown.len()));
 
     let filename = path
         .file_name()
@@ -46,6 +78,8 @@ fn main() {
 
     let tmp_html = write_temp_html(&full_html);
     let tmp_url = format!("file:///{}", tmp_html.to_string_lossy().replace('\\', "/"));
+    log(&format!("temp html: {}", tmp_html.display()));
+    log(&format!("loading url: {tmp_url}"));
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -87,6 +121,8 @@ fn main() {
         .build(&window)
         .expect("Failed to create webview");
 
+    log("webview created");
+
     // File watcher
     let watch_path = path.clone();
     let _watcher = {
@@ -119,9 +155,10 @@ fn main() {
             }
 
             Event::WindowEvent {
-                event: WindowEvent::DroppedFile(dropped_path),
+                event: WindowEvent::DroppedFile(ref dropped_path),
                 ..
             } => {
+                log(&format!("file dropped: {}", dropped_path.display()));
                 if dropped_path
                     .extension()
                     .map_or(false, |e| e == "md" || e == "markdown")
@@ -142,6 +179,7 @@ fn main() {
             }
 
             Event::UserEvent(UserEvent::FileChanged) => {
+                log("file changed, reloading");
                 if let Ok(md) = fs::read_to_string(&reload_path) {
                     let reload_base = reload_path.parent().unwrap_or_else(|| std::path::Path::new("."));
                     let html = render_markdown(&md, reload_base);
@@ -156,6 +194,7 @@ fn main() {
             }
 
             Event::UserEvent(UserEvent::CloseWindow) => {
+                log("closing");
                 *control_flow = ControlFlow::Exit;
             }
 
