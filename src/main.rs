@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use notify::{EventKind, RecursiveMode, Watcher};
 use pulldown_cmark::{html, Options, Parser};
 use std::collections::HashMap;
@@ -37,9 +39,13 @@ fn main() {
         .and_then(|f| f.to_str())
         .unwrap_or("mdview");
 
-    let full_html = render_markdown(&markdown);
+    let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let full_html = render_markdown(&markdown, base_dir);
     let scroll_key = scroll_key_for(&path);
     let saved_scroll = load_scroll_position(&scroll_key);
+
+    let tmp_html = write_temp_html(&full_html);
+    let tmp_url = format!("file:///{}", tmp_html.to_string_lossy().replace('\\', "/"));
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -47,22 +53,31 @@ fn main() {
     let window = WindowBuilder::new()
         .with_title(format!("{filename} — mdview"))
         .with_inner_size(LogicalSize::new(900.0, 700.0))
+        .with_decorations(false)
         .build(&event_loop)
         .expect("Failed to create window");
 
     let scroll_key_ipc = scroll_key.clone();
+    let proxy2 = proxy.clone();
     let webview = WebViewBuilder::new()
-        .with_html(&full_html)
+        .with_url(&tmp_url)
         .with_initialization_script(&format!(
             r#"window.addEventListener('load', function() {{ window.scrollTo(0, {saved_scroll}); }});
             setInterval(function() {{ window.ipc.postMessage('scroll:' + window.scrollY); }}, 2000);"#
         ))
+        .with_initialization_script(DRAG_RESIZE_JS)
         .with_ipc_handler(move |msg| {
             let msg = msg.body();
             if let Some(pos_str) = msg.strip_prefix("scroll:") {
                 if let Ok(pos) = pos_str.parse::<f64>() {
                     save_scroll_position(&scroll_key_ipc, pos);
                 }
+            } else if msg == "drag" {
+                let _ = proxy2.send_event(UserEvent::DragWindow);
+            } else if msg == "close" {
+                let _ = proxy2.send_event(UserEvent::CloseWindow);
+            } else if let Some(url) = msg.strip_prefix("open:") {
+                let _ = open::that(url);
             }
         })
         .with_new_window_req_handler(|uri| {
@@ -112,8 +127,11 @@ fn main() {
                     .map_or(false, |e| e == "md" || e == "markdown")
                 {
                     if let Ok(md) = fs::read_to_string(&dropped_path) {
-                        let html = render_markdown(&md);
-                        let _ = webview.load_html(&html);
+                        let drop_base = dropped_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                        let html = render_markdown(&md, drop_base);
+                        let tmp = write_temp_html(&html);
+                        let url = format!("file:///{}", tmp.to_string_lossy().replace('\\', "/"));
+                        let _ = webview.load_url(&url);
                         let title = dropped_path
                             .file_name()
                             .and_then(|f| f.to_str())
@@ -125,9 +143,20 @@ fn main() {
 
             Event::UserEvent(UserEvent::FileChanged) => {
                 if let Ok(md) = fs::read_to_string(&reload_path) {
-                    let html = render_markdown(&md);
-                    let _ = webview.load_html(&html);
+                    let reload_base = reload_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                    let html = render_markdown(&md, reload_base);
+                    let tmp = write_temp_html(&html);
+                    let url = format!("file:///{}", tmp.to_string_lossy().replace('\\', "/"));
+                    let _ = webview.load_url(&url);
                 }
+            }
+
+            Event::UserEvent(UserEvent::DragWindow) => {
+                let _ = window.drag_window();
+            }
+
+            Event::UserEvent(UserEvent::CloseWindow) => {
+                *control_flow = ControlFlow::Exit;
             }
 
             _ => {}
@@ -138,9 +167,11 @@ fn main() {
 #[derive(Debug)]
 enum UserEvent {
     FileChanged,
+    DragWindow,
+    CloseWindow,
 }
 
-fn render_markdown(markdown: &str) -> String {
+fn render_markdown(markdown: &str, base_dir: &std::path::Path) -> String {
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -149,6 +180,28 @@ fn render_markdown(markdown: &str) -> String {
 
     let mut html_body = String::new();
     html::push_html(&mut html_body, parser);
+
+    // Rewrite relative src= paths to absolute file:// URLs
+    let base_url = format!("file:///{}", base_dir.to_string_lossy().replace('\\', "/"));
+    let mut result = String::with_capacity(html_body.len());
+    let mut rest = html_body.as_str();
+    while let Some(idx) = rest.find("src=\"") {
+        result.push_str(&rest[..idx]);
+        let after = &rest[idx + 5..]; // after src="
+        if after.starts_with("http://")
+            || after.starts_with("https://")
+            || after.starts_with("file://")
+            || after.starts_with("data:")
+            || after.starts_with('/')
+        {
+            result.push_str("src=\"");
+        } else {
+            result.push_str(&format!("src=\"{base_url}/"));
+        }
+        rest = after;
+    }
+    result.push_str(rest);
+    html_body = result;
 
     format!(
         r#"<!DOCTYPE html>
@@ -159,6 +212,15 @@ fn render_markdown(markdown: &str) -> String {
 <script>{HIGHLIGHT_JS}</script>
 </body></html>"#
     )
+}
+
+fn write_temp_html(html: &str) -> PathBuf {
+    let mut dir = env::temp_dir();
+    dir.push("mdview");
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("preview.html");
+    fs::write(&path, html).expect("Failed to write temp HTML");
+    path
 }
 
 // -- Scroll position persistence --
@@ -350,6 +412,24 @@ const CSS: &str = r#"
     hr { height: 0.25em; padding: 0; margin: 24px 0; background: #21262d; border: 0; }
     img { max-width: 100%; }
     input[type="checkbox"] { margin-right: 0.5em; }
+    #mdview-close {
+        position: fixed;
+        top: 8px;
+        right: 12px;
+        width: 28px;
+        height: 28px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        color: #8b949e;
+        font-size: 14px;
+        border-radius: 4px;
+        z-index: 9999;
+        user-select: none;
+        transition: background 0.15s, color 0.15s;
+    }
+    #mdview-close:hover { background: #da3633; color: #fff; }
 "#;
 
 const HIGHLIGHT_CSS: &str = r#"
@@ -447,4 +527,39 @@ const HIGHLIGHT_JS: &str = r#"
         }
     });
 })();
+"#;
+
+const DRAG_RESIZE_JS: &str = r#"
+document.addEventListener('DOMContentLoaded', function() {
+    // Close button
+    var btn = document.createElement('div');
+    btn.id = 'mdview-close';
+    btn.innerHTML = '&#x2715;';
+    btn.addEventListener('click', function() { window.ipc.postMessage('close'); });
+    document.body.appendChild(btn);
+
+    // Alt+drag from anywhere to move window
+    document.addEventListener('mousedown', function(e) {
+        if (e.button !== 0 || !e.altKey) return;
+        e.preventDefault();
+        window.ipc.postMessage('drag');
+    });
+
+    // Ctrl+Q to quit
+    document.addEventListener('keydown', function(e) {
+        if (e.ctrlKey && e.key === 'q') {
+            e.preventDefault();
+            window.ipc.postMessage('close');
+        }
+    });
+
+    // Make links open in default browser
+    document.addEventListener('click', function(e) {
+        var a = e.target.closest('a');
+        if (a && a.href && !a.href.startsWith('about:')) {
+            e.preventDefault();
+            window.ipc.postMessage('open:' + a.href);
+        }
+    });
+});
 "#;
