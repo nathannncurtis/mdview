@@ -1,5 +1,7 @@
 # mdview
 
+> **Note:** This is the original Rust/WebView2 implementation. A rewrite using Zig + DirectWrite is available at [mdview-zig](https://github.com/nathannncurtis/mdview-zig) — same features, ~240 KB binary, no webview dependency.
+
 A fast, lightweight markdown viewer for Windows. No editing — just opens `.md` files and renders them with dark-mode formatting.
 
 ## Features
