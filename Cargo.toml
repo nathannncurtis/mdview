@@ -1,0 +1,13 @@
+[package]
+name = "mdview"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wry = "0.51"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
