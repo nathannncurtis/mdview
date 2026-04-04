@@ -4,7 +4,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use pulldown_cmark::{html, Options, Parser};
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::{env, fs, path::PathBuf, process};
 
 static LOG_FILE: Mutex<Option<fs::File>> = Mutex::new(None);
@@ -40,6 +40,9 @@ use wry::WebViewBuilder;
 
 fn main() {
     init_log();
+    std::panic::set_hook(Box::new(|info| {
+        log(&format!("PANIC: {info}"));
+    }));
     let args: Vec<String> = env::args().collect();
     log(&format!("started with args: {:?}", args));
 
@@ -58,6 +61,8 @@ fn main() {
         log(&format!("failed to resolve path {}: {e}", &args[1]));
         process::exit(1);
     });
+    // Strip \\?\ prefix that Windows canonicalize adds
+    let path = PathBuf::from(path.to_string_lossy().trim_start_matches("\\\\?\\").to_string());
     log(&format!("opening: {}", path.display()));
 
     let markdown = fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -76,10 +81,8 @@ fn main() {
     let scroll_key = scroll_key_for(&path);
     let saved_scroll = load_scroll_position(&scroll_key);
 
-    let tmp_html = write_temp_html(&full_html);
-    let tmp_url = format!("file:///{}", tmp_html.to_string_lossy().replace('\\', "/"));
-    log(&format!("temp html: {}", tmp_html.display()));
-    log(&format!("loading url: {tmp_url}"));
+    let html_content: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(full_html.into_bytes()));
+    log("rendering html via custom protocol");
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -93,8 +96,16 @@ fn main() {
 
     let scroll_key_ipc = scroll_key.clone();
     let proxy2 = proxy.clone();
+    let html_for_protocol = Arc::clone(&html_content);
     let webview = WebViewBuilder::new()
-        .with_url(&tmp_url)
+        .with_custom_protocol("mdview".into(), move |_id, _request| {
+            let body = html_for_protocol.lock().unwrap().clone();
+            wry::http::Response::builder()
+                .header("Content-Type", "text/html; charset=utf-8")
+                .body(body.into())
+                .unwrap()
+        })
+        .with_url("mdview://localhost")
         .with_initialization_script(&format!(
             r#"window.addEventListener('load', function() {{ window.scrollTo(0, {saved_scroll}); }});
             setInterval(function() {{ window.ipc.postMessage('scroll:' + window.scrollY); }}, 2000);"#
@@ -114,14 +125,11 @@ fn main() {
                 let _ = open::that(url);
             }
         })
-        .with_new_window_req_handler(|uri| {
-            let _ = open::that(uri);
-            false
-        })
         .build(&window)
         .expect("Failed to create webview");
 
     log("webview created");
+    log("setting up file watcher");
 
     // File watcher
     let watch_path = path.clone();
@@ -141,7 +149,10 @@ fn main() {
         watcher
     };
 
+    log("file watcher ready");
+
     let reload_path = path.clone();
+    log("entering event loop");
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -166,9 +177,8 @@ fn main() {
                     if let Ok(md) = fs::read_to_string(&dropped_path) {
                         let drop_base = dropped_path.parent().unwrap_or_else(|| std::path::Path::new("."));
                         let html = render_markdown(&md, drop_base);
-                        let tmp = write_temp_html(&html);
-                        let url = format!("file:///{}", tmp.to_string_lossy().replace('\\', "/"));
-                        let _ = webview.load_url(&url);
+                        *html_content.lock().unwrap() = html.into_bytes();
+                        let _ = webview.load_url("mdview://localhost");
                         let title = dropped_path
                             .file_name()
                             .and_then(|f| f.to_str())
@@ -183,9 +193,8 @@ fn main() {
                 if let Ok(md) = fs::read_to_string(&reload_path) {
                     let reload_base = reload_path.parent().unwrap_or_else(|| std::path::Path::new("."));
                     let html = render_markdown(&md, reload_base);
-                    let tmp = write_temp_html(&html);
-                    let url = format!("file:///{}", tmp.to_string_lossy().replace('\\', "/"));
-                    let _ = webview.load_url(&url);
+                    *html_content.lock().unwrap() = html.into_bytes();
+                    let _ = webview.load_url("mdview://localhost");
                 }
             }
 
@@ -251,15 +260,6 @@ fn render_markdown(markdown: &str, base_dir: &std::path::Path) -> String {
 <script>{HIGHLIGHT_JS}</script>
 </body></html>"#
     )
-}
-
-fn write_temp_html(html: &str) -> PathBuf {
-    let mut dir = env::temp_dir();
-    dir.push("mdview");
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join("preview.html");
-    fs::write(&path, html).expect("Failed to write temp HTML");
-    path
 }
 
 // -- Scroll position persistence --
